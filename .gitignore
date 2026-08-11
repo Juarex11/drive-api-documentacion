@@ -1,0 +1,16 @@
+# Dependencias
+**/node_modules/
+
+# Next.js
+**/.next/
+
+# Variables de entorno con credenciales - NUNCA subir esto
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Estado local de subidas
+upload-state.json
+
+# Logs
+npm-debug.log*
