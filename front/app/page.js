@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 
 const statusColors = {
   pending: '#9aa0a6', uploading: '#1a73e8', labeling: '#f9ab00',
-  completed: '#188038', failed: '#d93025',
+  completed: '#188038', failed: '#d93025', paused: '#9c6ade',
 };
 
 function formatBytes(bytes) {
@@ -41,6 +41,8 @@ export default function Home() {
 
   const [newFolderName, setNewFolderName] = useState('');
   const [filePath, setFilePath] = useState('');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [browserUploadProgress, setBrowserUploadProgress] = useState(null);
   const [busy, setBusy] = useState(false);
   const [actionMessage, setActionMessage] = useState(null);
 
@@ -157,6 +159,108 @@ export default function Home() {
     finally { setBusy(false); }
   }
 
+  const BROWSER_CHUNK_SIZE = 8 * 1024 * 1024; // 8MB, igual que el backend
+
+  async function handleBrowserUpload() {
+    if (!selectedFile) return;
+    setBusy(true); setActionMessage(null);
+    setBrowserUploadProgress({ sent: 0, total: selectedFile.size });
+
+    try {
+      // Buscar si ya existe un intento previo del MISMO archivo (nombre + tamano)
+      // que se haya quedado a medias, para reanudar en vez de empezar de cero.
+      const existingMatch = uploads.find((u) =>
+        u.FileName === selectedFile.name &&
+        Number(u.FileSize) === selectedFile.size &&
+        (u.Status === 'uploading' || u.Status === 'failed')
+      );
+
+      let uploadId;
+      let offset = 0;
+
+      if (existingMatch) {
+        const wantsResume = confirm(
+          `Ya hay un intento previo de "${selectedFile.name}" que se quedo a medias. ¿Quieres reanudarlo desde donde se quedo, en vez de subirlo desde cero?`
+        );
+        if (wantsResume) {
+          const reconcileRes = await fetch(`/api/browser-uploads/${existingMatch.Id}/reconcile`, { method: 'POST' });
+          const reconcileData = await reconcileRes.json();
+          if (!reconcileRes.ok) throw new Error(reconcileData.error || 'Error reanudando');
+
+          if (reconcileData.completed) {
+            setActionMessage('Ese archivo ya se habia terminado de subir.');
+            setSelectedFile(null);
+            setBrowserUploadProgress(null);
+            fetchUploads();
+            return;
+          }
+          uploadId = existingMatch.Id;
+          offset = reconcileData.offset;
+          setBrowserUploadProgress({ sent: offset, total: selectedFile.size });
+        }
+      }
+
+      if (!uploadId) {
+        const startRes = await fetch('/api/browser-uploads', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileName: selectedFile.name, fileSize: selectedFile.size, folderId: currentFolderId || null }),
+        });
+        const startData = await startRes.json();
+        if (!startRes.ok) throw new Error(startData.error || 'Error iniciando subida');
+        uploadId = startData.id;
+      }
+
+      let offsetCursor = offset;
+      const total = selectedFile.size;
+
+      while (offsetCursor < total) {
+        const end = Math.min(offsetCursor + BROWSER_CHUNK_SIZE, total) - 1;
+        const chunkBlob = selectedFile.slice(offsetCursor, end + 1);
+
+        let chunkData = null;
+        let attempt = 0;
+        const maxRetries = 6;
+
+        while (attempt <= maxRetries) {
+          try {
+            const chunkRes = await fetch(`/api/browser-uploads/${uploadId}/chunk`, {
+              method: 'PUT',
+              headers: { 'Content-Range': `bytes ${offsetCursor}-${end}/${total}` },
+              body: chunkBlob,
+            });
+            chunkData = await chunkRes.json();
+            if (!chunkRes.ok) throw new Error(chunkData.error || 'Error subiendo chunk');
+            break;
+          } catch (chunkErr) {
+            attempt++;
+            if (attempt > maxRetries) throw chunkErr;
+            const waitMs = Math.min(30000, 1000 * 2 ** attempt);
+            setActionMessage(`Corte detectado, reintentando en ${Math.round(waitMs / 1000)}s (intento ${attempt}/${maxRetries})...`);
+            await new Promise((r) => setTimeout(r, waitMs));
+          }
+        }
+
+        offsetCursor = end + 1;
+        setBrowserUploadProgress({ sent: offsetCursor, total });
+
+        if (chunkData.done) {
+          setActionMessage(`"${selectedFile.name}" subido y etiquetado correctamente.`);
+          break;
+        }
+      }
+
+      setSelectedFile(null);
+      setBrowserUploadProgress(null);
+      fetchUploads();
+      fetchBrowse(currentFolderId, false);
+    } catch (err) {
+      setActionMessage(`Error: ${err.message}`);
+      setBrowserUploadProgress(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function startRename(item) {
     setEditingId(item.id);
     setEditingName(item.name);
@@ -205,6 +309,16 @@ export default function Home() {
       const res = await fetch(`/api/uploads/${uploadId}/retry`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Error reintentando');
+      fetchUploads();
+    } catch (err) { setActionMessage(`Error: ${err.message}`); }
+  }
+
+  async function handlePause(uploadId) {
+    try {
+      const res = await fetch(`/api/uploads/${uploadId}/pause`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error pausando');
+      setActionMessage('Pausa solicitada, se detendra en el siguiente chunk.');
       fetchUploads();
     } catch (err) { setActionMessage(`Error: ${err.message}`); }
   }
@@ -287,7 +401,10 @@ export default function Home() {
     <main style={{ maxWidth: 1000, margin: '0 auto', padding: '32px 24px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
         <h1 style={{ fontSize: 22, fontWeight: 500, color: '#202124', margin: 0 }}>Mi Drive</h1>
-        <a href="/labels" style={{ fontSize: 14, color: '#1a73e8', textDecoration: 'none' }}>Administrar etiquetas →</a>
+        <div style={{ display: 'flex', gap: 16 }}>
+          <a href="/docs" style={{ fontSize: 14, color: '#1a73e8', textDecoration: 'none' }}>Documentación</a>
+          <a href="/labels" style={{ fontSize: 14, color: '#1a73e8', textDecoration: 'none' }}>Administrar etiquetas →</a>
+        </div>
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 16, fontSize: 14 }}>
@@ -325,10 +442,41 @@ export default function Home() {
             <button style={buttonStyle(false)} disabled={busy} type="submit">Crear carpeta</button>
           </form>
         </div>
-        <form onSubmit={handleUpload} style={{ display: 'flex', gap: 8 }}>
+        <form onSubmit={handleUpload} style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
           <input style={inputStyle()} placeholder="Ruta del archivo en el servidor" value={filePath} onChange={(e) => setFilePath(e.target.value)} />
           <button style={buttonStyle(true)} disabled={busy} type="submit">Subir aqui</button>
         </form>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, borderTop: '1px solid #f1f3f4', paddingTop: 10 }}>
+          <span style={{ fontSize: 12, color: '#5f6368' }}>o</span>
+          <input
+            type="file"
+            onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+            style={{ fontSize: 13, flex: 1 }}
+          />
+          <button
+            onClick={handleBrowserUpload}
+            disabled={!selectedFile || busy}
+            style={buttonStyle(true, { opacity: !selectedFile || busy ? 0.5 : 1 })}
+          >
+            Subir seleccionado
+          </button>
+        </div>
+
+        {browserUploadProgress && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ background: '#e8eaed', borderRadius: 999, height: 6, overflow: 'hidden' }}>
+              <div style={{
+                width: `${Math.round((browserUploadProgress.sent / browserUploadProgress.total) * 100)}%`,
+                height: '100%', background: '#1a73e8', transition: 'width 0.2s ease',
+              }} />
+            </div>
+            <div style={{ fontSize: 12, color: '#5f6368', marginTop: 4 }}>
+              {formatBytes(browserUploadProgress.sent)} / {formatBytes(browserUploadProgress.total)}
+              {' '}({Math.round((browserUploadProgress.sent / browserUploadProgress.total) * 100)}%)
+            </div>
+          </div>
+        )}
         {actionMessage && (
           <div style={{ marginTop: 10, fontSize: 13, color: actionMessage.startsWith('Error') ? '#d93025' : '#188038' }}>{actionMessage}</div>
         )}
@@ -426,7 +574,14 @@ export default function Home() {
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                     <span style={{ fontSize: 13, fontWeight: 500 }}>{u.FileName}</span>
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                      {u.Status === 'failed' && <button onClick={() => handleRetry(u.Id)} style={iconBtnStyle(false)}>Reintentar</button>}
+                      {u.Status === 'uploading' && (
+                        <button onClick={() => handlePause(u.Id)} style={iconBtnStyle(false)}>Pausar</button>
+                      )}
+                      {(u.Status === 'failed' || u.Status === 'paused') && (
+                        <button onClick={() => handleRetry(u.Id)} style={iconBtnStyle(false)}>
+                          {u.Status === 'paused' ? 'Reanudar' : 'Reintentar'}
+                        </button>
+                      )}
                       <span style={{ fontSize: 11, fontWeight: 500, color, background: color + '1a', padding: '2px 8px', borderRadius: 999, textTransform: 'uppercase' }}>{u.Status}</span>
                     </div>
                   </div>

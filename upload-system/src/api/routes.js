@@ -5,6 +5,8 @@ const { getAccessToken } = require('../google/auth');
 const { createFolder, listFolders } = require('../google/folders');
 const { applyLabel, applyLabelGeneric } = require('../google/labelApplier');
 const { registerUpload, runUpload } = require('../services/uploadService');
+const { startBrowserUpload, receiveBrowserChunk, reconcileBrowserUpload } = require('../services/browserUploadService');
+const { requestPause } = require('../services/pauseRegistry');
 const { renameItem, setTrashed, deletePermanently, listChildren } = require('../google/driveItems');
 const {
   listLabelsFull, createLabel, addChoice, renameLabel, renameField, disableLabel, deleteLabelOnly,
@@ -67,6 +69,11 @@ router.post('/uploads/:id/retry', async (req, res) => {
   }
 });
 
+router.post('/uploads/:id/pause', async (req, res) => {
+  requestPause(req.params.id);
+  res.json({ message: 'Pausa solicitada, se detendra tras el chunk en curso' });
+});
+
 router.post('/uploads/:id/label', async (req, res) => {
   const { choiceId } = req.body;
   if (!choiceId) {
@@ -90,6 +97,45 @@ router.post('/uploads/:id/label', async (req, res) => {
       .query('UPDATE dbo.Uploads SET LabelApplied = 1, UpdatedAt = SYSUTCDATETIME() WHERE Id = @id');
 
     res.json({ message: 'Label actualizado' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Subidas desde el navegador (boton "Elegir archivo") ----------
+
+router.post('/browser-uploads', async (req, res) => {
+  const { fileName, fileSize, folderId } = req.body;
+  if (!fileName || !fileSize) return res.status(400).json({ error: 'Falta fileName o fileSize' });
+  try {
+    const { id } = await startBrowserUpload(fileName, fileSize, folderId || null);
+    res.status(201).json({ id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.put('/browser-uploads/:id/chunk', express.raw({ type: () => true, limit: '50mb' }), async (req, res) => {
+  try {
+    const contentRange = req.headers['content-range'];
+    if (!contentRange) return res.status(400).json({ error: 'Falta header Content-Range' });
+
+    const match = contentRange.match(/bytes (\d+)-(\d+)\/(\d+)/);
+    if (!match) return res.status(400).json({ error: 'Content-Range con formato invalido' });
+
+    const start = parseInt(match[1], 10);
+    const end = parseInt(match[2], 10);
+    const total = parseInt(match[3], 10);
+
+    const result = await receiveBrowserChunk(req.params.id, req.body, start, end, total);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/browser-uploads/:id/reconcile', async (req, res) => {
+  try {
+    const result = await reconcileBrowserUpload(req.params.id);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -177,7 +223,7 @@ router.get('/browse', async (req, res) => {
   }
 });
 
-// ---------- Administracion de Labels (crear, renombrar, editar campo, deshabilitar) ----------
+// ---------- Administracion de Labels ----------
 
 router.get('/labels', async (req, res) => {
   try {
@@ -194,16 +240,6 @@ router.post('/labels', async (req, res) => {
     const accessToken = await getAccessToken();
     const label = await createLabel(accessToken, title, fieldName, choices || []);
     res.status(201).json({ label });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-router.post('/labels/:id/choices', async (req, res) => {
-  const { fieldId, name } = req.body;
-  if (!fieldId || !name) return res.status(400).json({ error: 'Falta fieldId o name' });
-  try {
-    const accessToken = await getAccessToken();
-    await addChoice(accessToken, req.params.id, fieldId, name);
-    res.json({ message: 'Opcion agregada' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -243,6 +279,16 @@ router.delete('/labels/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+router.post('/labels/:id/choices', async (req, res) => {
+  const { fieldId, name } = req.body;
+  if (!fieldId || !name) return res.status(400).json({ error: 'Falta fieldId o name' });
+  try {
+    const accessToken = await getAccessToken();
+    await addChoice(accessToken, req.params.id, fieldId, name);
+    res.json({ message: 'Opcion agregada' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.post('/labels/assign', async (req, res) => {
   const { itemId, labelId, fieldId, choiceId } = req.body;
   if (!itemId || !labelId || !fieldId || !choiceId) {
@@ -252,6 +298,37 @@ router.post('/labels/assign', async (req, res) => {
     const accessToken = await getAccessToken();
     await applyLabelGeneric(accessToken, itemId, labelId, fieldId, choiceId);
     res.json({ message: 'Label asignado' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ---------- Colores locales de labels (solo en tu SQL, no en Google) ----------
+
+router.get('/label-colors', async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request().query('SELECT LabelId, Color FROM dbo.LabelColors');
+    const colors = {};
+    result.recordset.forEach((row) => { colors[row.LabelId] = row.Color; });
+    res.json({ colors });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/label-colors', async (req, res) => {
+  const { labelId, color } = req.body;
+  if (!labelId || !color) return res.status(400).json({ error: 'Falta labelId o color' });
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('labelId', sql.NVarChar, labelId)
+      .input('color', sql.NVarChar, color)
+      .query(`
+        MERGE dbo.LabelColors AS target
+        USING (SELECT @labelId AS LabelId, @color AS Color) AS src
+        ON target.LabelId = src.LabelId
+        WHEN MATCHED THEN UPDATE SET Color = src.Color, UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN INSERT (LabelId, Color) VALUES (src.LabelId, src.Color);
+      `);
+    res.json({ message: 'Color guardado' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
